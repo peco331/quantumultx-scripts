@@ -15,7 +15,7 @@
 - BDTB_MaxSign_Count: 每次最多签到数量（默认100）
 
 脚本兼容：QuantumultX, Surge, Loon
-更新日期：2025-12-03
+更新日期：2024-12-03
 原作者：@sazs34
 优化：防风控、详细日志、限制签到数量
 **********************************/
@@ -24,9 +24,15 @@ var $nobyda = nobyda();
 var cookieVal = $nobyda.read("CookieTB");
 var useParallel = 0;
 var singleNotifyCount = 20;
-var maxSignCount = 100; // 每次最多签到100个，防止触发验证码
+var maxSignCount = 100; // 每批最多签到100个
+var batchDelay = 60; // 批次间延迟秒数（默认60秒=1分钟）
 var process = {
   total: 0,
+  realTotal: 0,
+  currentBatch: 0,
+  totalBatches: 0,
+  allForums: [],
+  tbs: "",
   result: []
 };
 
@@ -61,6 +67,7 @@ function signTieBa() {
   useParallel = $nobyda.read("BDTB_DailyBonus_Mode") || useParallel;
   singleNotifyCount = $nobyda.read("BDTB_DailyBonus_notify") || singleNotifyCount;
   maxSignCount = $nobyda.read("BDTB_MaxSign_Count") || maxSignCount;
+  batchDelay = $nobyda.read("BDTB_Batch_Delay") || batchDelay;
   
   if (!cookieVal) {
     $nobyda.notify("贴吧签到", "签到失败", "未获取到Cookie，请先获取Cookie");
@@ -86,27 +93,18 @@ function signTieBa() {
           return $nobyda.done()
         }
         
-        // 限制签到数量，防止触发验证码
-        var totalForums = body.data.like_forum.length;
-        var forumsToSign = body.data.like_forum.slice(0, maxSignCount);
-        process.total = forumsToSign.length;
+        // 保存所有数据
+        process.allForums = body.data.like_forum;
+        process.realTotal = body.data.like_forum.length;
+        process.tbs = body.data.tbs;
+        process.totalBatches = Math.ceil(process.realTotal / maxSignCount);
+        process.currentBatch = 1;
         
-        console.log(`关注贴吧总数: ${totalForums}, 本次签到: ${process.total}`);
+        console.log(`关注贴吧总数: ${process.realTotal}, 分${process.totalBatches}批签到, 每批${maxSignCount}个`);
         
-        if (totalForums > maxSignCount) {
-          console.log(`为防止触发验证码，只签到前${maxSignCount}个贴吧`);
-        }
+        // 开始第一批签到
+        signNextBatch();
         
-        // 选择签到模式
-        if (useParallel == 1 || (useParallel == 0 && forumsToSign.length >= 30)) {
-          console.log("使用串行模式签到");
-          signBars(forumsToSign, body.data.tbs, 0);
-        } else {
-          console.log("使用并行模式签到");
-          for (const bar of forumsToSign) {
-            signBar(bar, body.data.tbs);
-          }
-        }
       } catch (e) {
         console.log("数据解析异常: " + e.message);
         $nobyda.notify("贴吧签到", "数据解析失败", "请检查Cookie是否有效");
@@ -114,6 +112,29 @@ function signTieBa() {
       }
     }
   })
+}
+
+function signNextBatch() {
+  var startIndex = (process.currentBatch - 1) * maxSignCount;
+  var endIndex = Math.min(startIndex + maxSignCount, process.realTotal);
+  var forumsToSign = process.allForums.slice(startIndex, endIndex);
+  
+  console.log(`开始第${process.currentBatch}/${process.totalBatches}批签到, 签到${forumsToSign.length}个贴吧`);
+  
+  // 更新当前批次的总数
+  process.total = forumsToSign.length;
+  process.result = []; // 重置当前批次结果
+  
+  // 选择签到模式
+  if (useParallel == 1 || (useParallel == 0 && forumsToSign.length >= 30)) {
+    console.log("使用串行模式签到");
+    signBars(forumsToSign, process.tbs, 0);
+  } else {
+    console.log("使用并行模式签到");
+    for (const bar of forumsToSign) {
+      signBar(bar, process.tbs);
+    }
+  }
 }
 
 function signBar(bar, tbs) {
@@ -222,32 +243,28 @@ function signBars(bars, tbs, index) {
 function checkIsAllProcessed() {
   if (process.result.length != process.total) return;
   
-  // 先统计总数据
-  var totalSuccess = 0;      // 新签到成功
-  var totalAlready = 0;      // 已经签到
-  var totalFail = 0;         // 签到失败
-  var failList = [];         // 失败列表
-  var resultsCopy = [...process.result]; // 复制一份用于统计
+  // 先统计本批次数据
+  var batchSuccess = 0;      // 新签到成功
+  var batchAlready = 0;      // 已经签到
+  var batchFail = 0;         // 签到失败
   
-  for (const res of resultsCopy) {
+  for (const res of process.result) {
     if (res.errorCode == 0) {
-      totalSuccess++;
+      batchSuccess++;
     } else if (res.errorCode == 9999) {
-      totalAlready++;
+      batchAlready++;
     } else {
-      totalFail++;
-      failList.push({
-        bar: res.bar,
-        reason: res.errorMsg
-      });
+      batchFail++;
     }
   }
   
-  // 分批发送详细通知
-  var batchCount = Math.ceil(process.total / singleNotifyCount);
-  for (var i = 0; i < batchCount; i++) {
+  // 发送当前批次的详细通知
+  var batchNotifyCount = Math.ceil(process.total / singleNotifyCount);
+  var resultsCopy = [...process.result];
+  
+  for (var i = 0; i < batchNotifyCount; i++) {
     var notify = "";
-    var spliceArr = process.result.splice(0, singleNotifyCount);
+    var spliceArr = resultsCopy.splice(0, singleNotifyCount);
     var notifySuccessCount = 0;
     for (const res of spliceArr) {
       if (res.errorCode == 0 || res.errorCode == 9999) {
@@ -260,35 +277,82 @@ function checkIsAllProcessed() {
       }
     }
     
-    // 如果有多批，显示批次信息
-    var subtitle = batchCount > 1 ? 
-      `第${i+1}批: 签到${spliceArr.length}个,成功${notifySuccessCount}个` : 
-      `签到${spliceArr.length}个,成功${notifySuccessCount}个`;
+    var subtitle = batchNotifyCount > 1 ? 
+      `第${process.currentBatch}大批-第${i+1}小批: 签到${spliceArr.length}个,成功${notifySuccessCount}个` : 
+      `第${process.currentBatch}/${process.totalBatches}批: 签到${spliceArr.length}个,成功${notifySuccessCount}个`;
     
     $nobyda.notify("贴吧签到", subtitle, notify);
   }
   
-  // 最后发送总结通知
-  var summary = `📊 签到统计报告\n\n`;
-  summary += `✅ 新签到成功: ${totalSuccess}个\n`;
-  summary += `✓ 今日已签到: ${totalAlready}个\n`;
-  summary += `❌ 签到失败: ${totalFail}个\n`;
-  summary += `━━━━━━━━━━━━━━\n`;
-  summary += `📝 总计: ${process.total}个贴吧\n`;
-  summary += `💯 成功率: ${Math.round((totalSuccess + totalAlready) / process.total * 100)}%`;
-  
-  // 如果有失败的，列出失败列表
-  if (failList.length > 0) {
-    summary += `\n\n⚠️ 失败列表:\n`;
-    for (var i = 0; i < failList.length; i++) {
-      summary += `${i+1}. 【${failList[i].bar}】${failList[i].reason}\n`;
-    }
+  // 检查是否还有下一批
+  if (process.currentBatch < process.totalBatches) {
+    var remainingCount = process.realTotal - (process.currentBatch * maxSignCount);
+    var delayMsg = `第${process.currentBatch}批完成！\n\n`;
+    delayMsg += `✅ 本批签到: ${process.total}个\n`;
+    delayMsg += `⏳ 剩余贴吧: ${remainingCount}个\n`;
+    delayMsg += `🕐 等待${batchDelay}秒后继续下一批...`;
+    
+    $nobyda.notify("贴吧签到", `批次休息中`, delayMsg);
+    
+    console.log(`第${process.currentBatch}批完成，等待${batchDelay}秒后继续...`);
+    
+    // 延迟后执行下一批
+    setTimeout(function() {
+      process.currentBatch++;
+      signNextBatch();
+    }, batchDelay * 1000);
+    
+  } else {
+    // 所有批次完成，发送总结
+    sendFinalSummary();
   }
+}
+
+function sendFinalSummary() {
+  // 统计所有批次的总数据
+  var allResults = [];
   
-  $nobyda.notify("贴吧签到完成", `共${process.total}个贴吧`, summary);
-  
-  console.log(`签到完成: 新签${totalSuccess}个, 已签${totalAlready}个, 失败${totalFail}个`);
-  $nobyda.done()
+  // 重新获取所有结果（从存储中读取）
+  $nobyda.get(url_fetch_sign, function(error, response, data) {
+    if (!error && data) {
+      try {
+        var body = JSON.parse(data);
+        if (body && body.data && body.data.like_forum) {
+          var totalSuccess = 0;
+          var totalAlready = 0;
+          var totalFail = 0;
+          var failList = [];
+          
+          for (const forum of body.data.like_forum) {
+            if (forum.is_sign == 1) {
+              totalAlready++;
+            } else {
+              // 未签到的算作失败（可能是被跳过的或实际失败的）
+              totalFail++;
+              if (process.realTotal > maxSignCount * process.totalBatches) {
+                // 这些是因为限制而未签到的
+              }
+            }
+          }
+          
+          var summary = `📊 全部签到完成\n\n`;
+          summary += `🎯 关注总数: ${process.realTotal}个贴吧\n`;
+          summary += `✅ 签到成功: ${totalAlready}个\n`;
+          summary += `❌ 签到失败: ${totalFail}个\n`;
+          summary += `━━━━━━━━━━━━━━\n`;
+          summary += `📦 分批次数: ${process.totalBatches}批\n`;
+          summary += `💯 成功率: ${Math.round(totalAlready / process.realTotal * 100)}%`;
+          
+          $nobyda.notify("🎉 贴吧签到完成", `总计${process.realTotal}个贴吧`, summary);
+        }
+      } catch (e) {
+        console.log("总结统计异常: " + e.message);
+      }
+    }
+    
+    console.log(`所有${process.totalBatches}批签到完成！`);
+    $nobyda.done();
+  });
 }
 
 function GetCookie() {
