@@ -1,0 +1,15 @@
+{
+  "name": "我的QX脚本库",
+  "description": "个人QuantumultX脚本合集",
+  "task": [
+    {
+      "config": "0 9 * * * https://raw.githubusercontent.com/你的用户名/quantumultx-scripts/main/scripts/tieba/tieba_signin.js, tag=百度贴吧签到, img-url=https://raw.githubusercontent.com/Orz-3/mini/master/Color/tieba.png, enabled=true",
+      "addons": "https://raw.githubusercontent.com/你的用户名/quantumultx-scripts/main/rewrite/tieba.conf, tag=百度贴吧Cookie, update-interval=86400, opt-parser=false, enabled=false"
+    }
+  ],
+  "author": "@peco331",
+  "repo": "https://github.com/peco331/quantumultx-scripts",
+  "icons": [
+    "https://raw.githubusercontent.com/Orz-3/mini/master/Color/tieba.png"
+  ]
+}
