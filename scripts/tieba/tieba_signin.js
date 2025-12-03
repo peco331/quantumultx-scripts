@@ -15,7 +15,7 @@
 - BDTB_MaxSign_Count: 每次最多签到数量（默认100）
 
 脚本兼容：QuantumultX, Surge, Loon
-更新日期：2024-12-03
+更新日期：2025-12-03
 原作者：@sazs34
 优化：防风控、详细日志、限制签到数量
 **********************************/
@@ -222,7 +222,8 @@ function signBars(bars, tbs, index) {
 function checkIsAllProcessed() {
   if (process.result.length != process.total) return;
   
-  for (var i = 0; i < Math.ceil(process.total / singleNotifyCount); i++) {
+  var batchCount = Math.ceil(process.total / singleNotifyCount);
+  for (var i = 0; i < batchCount; i++) {
     var notify = "";
     var spliceArr = process.result.splice(0, singleNotifyCount);
     var notifySuccessCount = 0;
@@ -236,9 +237,15 @@ function checkIsAllProcessed() {
         notify += `【${res.bar}】${res.errorCode==0?'签到成功':'签到失败'}，${res.errorCode==0?res.errorMsg:('原因：'+res.errorMsg)}\n`;
       }
     }
-    $nobyda.notify("贴吧签到", `签到${spliceArr.length}个,成功${notifySuccessCount}个`, notify);
-    $nobyda.done()
+    
+    // 如果有多批，显示批次信息
+    var subtitle = batchCount > 1 ? 
+      `第${i+1}批: 签到${spliceArr.length}个,成功${notifySuccessCount}个` : 
+      `签到${spliceArr.length}个,成功${notifySuccessCount}个`;
+    
+    $nobyda.notify("贴吧签到", subtitle, notify);
   }
+  $nobyda.done()
 }
 
 function GetCookie() {
