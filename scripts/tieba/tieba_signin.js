@@ -222,6 +222,28 @@ function signBars(bars, tbs, index) {
 function checkIsAllProcessed() {
   if (process.result.length != process.total) return;
   
+  // 先统计总数据
+  var totalSuccess = 0;      // 新签到成功
+  var totalAlready = 0;      // 已经签到
+  var totalFail = 0;         // 签到失败
+  var failList = [];         // 失败列表
+  var resultsCopy = [...process.result]; // 复制一份用于统计
+  
+  for (const res of resultsCopy) {
+    if (res.errorCode == 0) {
+      totalSuccess++;
+    } else if (res.errorCode == 9999) {
+      totalAlready++;
+    } else {
+      totalFail++;
+      failList.push({
+        bar: res.bar,
+        reason: res.errorMsg
+      });
+    }
+  }
+  
+  // 分批发送详细通知
   var batchCount = Math.ceil(process.total / singleNotifyCount);
   for (var i = 0; i < batchCount; i++) {
     var notify = "";
@@ -245,6 +267,27 @@ function checkIsAllProcessed() {
     
     $nobyda.notify("贴吧签到", subtitle, notify);
   }
+  
+  // 最后发送总结通知
+  var summary = `📊 签到统计报告\n\n`;
+  summary += `✅ 新签到成功: ${totalSuccess}个\n`;
+  summary += `✓ 今日已签到: ${totalAlready}个\n`;
+  summary += `❌ 签到失败: ${totalFail}个\n`;
+  summary += `━━━━━━━━━━━━━━\n`;
+  summary += `📝 总计: ${process.total}个贴吧\n`;
+  summary += `💯 成功率: ${Math.round((totalSuccess + totalAlready) / process.total * 100)}%`;
+  
+  // 如果有失败的，列出失败列表
+  if (failList.length > 0) {
+    summary += `\n\n⚠️ 失败列表:\n`;
+    for (var i = 0; i < failList.length; i++) {
+      summary += `${i+1}. 【${failList[i].bar}】${failList[i].reason}\n`;
+    }
+  }
+  
+  $nobyda.notify("贴吧签到完成", `共${process.total}个贴吧`, summary);
+  
+  console.log(`签到完成: 新签${totalSuccess}个, 已签${totalAlready}个, 失败${totalFail}个`);
   $nobyda.done()
 }
 
