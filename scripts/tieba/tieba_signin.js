@@ -222,49 +222,23 @@ function signBars(bars, tbs, index) {
 function checkIsAllProcessed() {
   if (process.result.length != process.total) return;
   
-  var successCount = 0;
-  var failCount = 0;
-  var alreadySignedCount = 0;
-  
-  // 统计结果
-  for (const res of process.result) {
-    if (res.errorCode == 0) {
-      successCount++;
-    } else if (res.errorCode == 9999) {
-      alreadySignedCount++;
-    } else {
-      failCount++;
-    }
-  }
-  
-  // 分批通知
   for (var i = 0; i < Math.ceil(process.total / singleNotifyCount); i++) {
     var notify = "";
     var spliceArr = process.result.splice(0, singleNotifyCount);
     var notifySuccessCount = 0;
-    
     for (const res of spliceArr) {
       if (res.errorCode == 0 || res.errorCode == 9999) {
         notifySuccessCount++;
       }
       if (res.errorCode == 9999) {
-        notify += `【${res.bar}】已签到 Lv.${res.level}\n`;
-      } else if (res.errorCode == 0) {
-        notify += `【${res.bar}】签到成功 ${res.errorMsg}\n`;
+        notify += `【${res.bar}】已经签到，当前等级${res.level},经验${res.exp}\n`;
       } else {
-        notify += `【${res.bar}】失败: ${res.errorMsg}\n`;
+        notify += `【${res.bar}】${res.errorCode==0?'签到成功':'签到失败'}，${res.errorCode==0?res.errorMsg:('原因：'+res.errorMsg)}\n`;
       }
     }
-    
-    var title = i === 0 ? 
-      `贴吧签到完成 (${successCount}新/${alreadySignedCount}已/${failCount}失败)` : 
-      `贴吧签到 (第${i+1}批)`;
-    
-    $nobyda.notify("贴吧签到", title, notify);
+    $nobyda.notify("贴吧签到", `签到${spliceArr.length}个,成功${notifySuccessCount}个`, notify);
+    $nobyda.done()
   }
-  
-  console.log(`签到完成: 新签${successCount}个, 已签${alreadySignedCount}个, 失败${failCount}个`);
-  $nobyda.done()
 }
 
 function GetCookie() {
