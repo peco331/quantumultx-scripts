@@ -25,7 +25,7 @@ var cookieVal = $nobyda.read("CookieTB");
 var useParallel = 0;
 var singleNotifyCount = 20;
 var maxSignCount = 100; // 每批最多签到100个
-var batchDelay = 60; // 批次间延迟秒数（默认60秒=1分钟）
+var batchDelay = 600; // 批次间延迟秒数（默认60秒=1分钟）
 var process = {
   total: 0,
   realTotal: 0,
