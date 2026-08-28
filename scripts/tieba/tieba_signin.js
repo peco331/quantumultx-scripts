@@ -12,7 +12,7 @@
  * - 签完后从 newmoindex + c/f/forum/like 两个来源重新拉取服务器签到状态
  * - 对“服务器显示未签”或“接口自称成功但服务器无记录”的吧强制再签一遍复核
  *   （复核返回“已签过/成功”才算确认；不依赖任何列表字段，接口说已签也算服务器结论）
- * - 最终通知只报“已签/未确认”两种状态，未确认的逐个列出
+ * - 最终通知分三类如实上报：已签 / 接口已签但状态未更新（矛盾，需人工看签到日历判断是缓存还是吞签）/ 未确认
  *
  * 可选持久化配置（$prefs，可用 BoxJS 或其他脚本写入）：
  * - BDTB_Concurrency：同时在途的签到请求数，默认 1，范围 1–10
@@ -114,7 +114,7 @@ async function run() {
         const flag = statusMap ? statusMap.get(forum.forum_name) : undefined;
         const status = results[i] && results[i].status;
         const doubtful = statusMap
-          ? flag === false || (flag === undefined && (status === 'success' || status === 'failed') && !reverified.has(i))
+          ? (flag === false || (flag === undefined && (status === 'success' || status === 'failed'))) && !reverified.has(i)
           : (status === 'success' || status === 'failed') && !reverified.has(i);
         if (doubtful) targets.push(i);
       });
@@ -205,10 +205,19 @@ async function getAccountNickname(bduss) {
     });
     const data = parseJson(response.body);
     const user = data && (data.user || (data.data && data.data.user));
+    let nickname = '';
     if (user && (user.name_show || user.nickname || user.name)) {
-      return String(user.name_show || user.nickname || user.name);
+      nickname = String(user.name_show || user.nickname || user.name);
     }
-    console.log(`账号信息响应（未解析到昵称）: ${String(response.body).slice(0, 200)}`);
+    if (!nickname) {
+      const raw = String(response.body || '');
+      for (const key of ['name_show', 'user_name', 'nick_name', 'nickname', 'name']) {
+        const m = new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`).exec(raw);
+        if (m && m[1]) { nickname = m[1]; break; }
+      }
+    }
+    if (nickname) return nickname;
+    console.log(`账号信息响应（未解析到昵称）: ${String(response.body || '').slice(0, 300)}`);
     return '';
   } catch (error) {
     console.log(`获取账号信息失败: ${error.message || error}`);
@@ -480,6 +489,7 @@ async function runWithConcurrency(items, limit, interval, worker, deadline) {
 
 function summarize(forums, results, statusMap, nickname) {
   const lines = [`账号：${nickname || '未知（请核对是否与 App 登录账号一致）'}`, `关注总数：${forums.length}`];
+  const conflicts = [];
   const problems = [];
   let signed = 0;
 
@@ -487,12 +497,12 @@ function summarize(forums, results, statusMap, nickname) {
     const serverFlag = statusMap ? statusMap.get(forum.forum_name) : undefined;
     const attempt = results[i];
     const attemptOk = attempt && (attempt.status === 'success' || attempt.status === 'already');
-    if (serverFlag === true || attemptOk) {
+    if (attemptOk && serverFlag !== false) {
       signed++;
+    } else if (attemptOk && serverFlag === false) {
+      conflicts.push({ name: forum.forum_name, message: attempt.message || '接口返回已签' });
     } else {
-      const reason = attempt && attempt.message ? attempt.message
-        : serverFlag === false ? '服务器显示未签'
-        : '未确认';
+      const reason = attempt && attempt.message ? attempt.message : serverFlag === false ? '服务器显示未签' : '未确认';
       problems.push({ name: forum.forum_name, message: reason });
     }
   });
@@ -500,13 +510,17 @@ function summarize(forums, results, statusMap, nickname) {
   const source = statusMap
     ? `（核验数据 ${statusMap.size} 条）`
     : '（服务器状态列表不可用，已签结果来自签到接口复核）';
-  lines.push(`已签：${signed}`, `未确认：${problems.length}`, source);
+  lines.push(`已签：${signed}`, `接口已签但状态未更新：${conflicts.length}`, `未确认：${problems.length}`, source);
+  if (conflicts.length) {
+    lines.push('', '以下吧签到接口返回成功/已签，但状态列表仍显示未签。', '可能是状态缓存延迟（次日自愈），也可能是风控吞签；请在 App 里进其中一个吧查看今天的签到日历即可判断：');
+    conflicts.forEach(item => lines.push(`【${item.name}】${item.message}`));
+  }
   if (problems.length) {
     lines.push('', '以下吧未确认签到成功：');
     problems.forEach(item => lines.push(`【${item.name}】${item.message}`));
   }
 
-  const subtitle = `总计 ${forums.length}｜已签 ${signed}｜未确认 ${problems.length}`;
+  const subtitle = `总计 ${forums.length}｜已签 ${signed}｜状态未更新 ${conflicts.length}｜未确认 ${problems.length}`;
   console.log(lines.join('\n'));
   $nobyda.notify('贴吧签到完成', subtitle, lines.join('\n'));
 }
