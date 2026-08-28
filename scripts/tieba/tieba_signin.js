@@ -1,31 +1,48 @@
 /*
  * 百度贴吧全量签到（Quantumult X）
  *
- * 改动：
- * - 使用 c.tieba.baidu.com/c/f/forum/like 分页获取关注列表（每页 200 条）
- * - 合并 newmoindex 的结果并按 forum_id / 名称去重
- * - 不再限制 100 个，也没有分批停顿；所有关注贴吧在同一次任务内处理
- * - 使用低并发和连续请求节流，减少“need vcode”概率，避免并发时复用 POST body 的竞态
+ * 针对 “need vcode” 风控的改进：
+ * - 默认串行签到（并发 1），请求间隔 1200ms 起并叠加随机抖动，降低触发风控的概率
+ * - 每个吧先走客户端接口 c/c/forum/sign（带 fid 的 tiebaclient 签名），失败或命中验证码时退回网页接口 sign/add
+ * - 命中 need vcode / 签得太快 等临时错误时，随机等待 6–14 秒后自动重试
+ * - 整轮结束后对失败的吧再补签一轮；连续多次 vcode 会熔断逐吧重试，避免持续刺激风控
+ * - 全程受时间预算约束，超时后跳过剩余贴吧并如实通知（当天的下一次 cron 会继续签）
  *
- * 可选持久化配置：
- * - BDTB_Concurrency：同时在途的签到请求数，默认 2，范围 1–20
- * - BDTB_RequestInterval：相邻签到请求的最小启动间隔（毫秒），默认 300，范围 0–3000
+ * 可选持久化配置（$prefs，可用 BoxJS 或其他脚本写入）：
+ * - BDTB_Concurrency：同时在途的签到请求数，默认 1，范围 1–10
+ * - BDTB_RequestInterval：相邻签到请求的最小启动间隔（毫秒），默认 1200，范围 0–10000
+ * - BDTB_MaxRetries：单个吧命中临时错误后的额外重试次数，默认 2，范围 0–5
+ * - BDTB_RetryPasses：整轮结束后对失败吧补签的轮数，默认 1，范围 0–3
+ * - BDTB_TimeBudget：整次任务的时间预算（秒），默认 480，范围 60–1800
  * - BDTB_MaxPages：关注列表最多读取的页数，默认 50（每页 200 个）
  */
 
 const $nobyda = nobyda();
 const cookieVal = $nobyda.read('CookieTB');
 const appVersion = '9.7.8.0';
-const concurrency = clampNumber($nobyda.read('BDTB_Concurrency'), 2, 1, 20);
-const requestInterval = clampNumber($nobyda.read('BDTB_RequestInterval'), 300, 0, 3000);
+const concurrency = clampNumber($nobyda.read('BDTB_Concurrency'), 1, 1, 10);
+const requestInterval = clampNumber($nobyda.read('BDTB_RequestInterval'), 1200, 0, 10000);
+const maxRetries = clampNumber($nobyda.read('BDTB_MaxRetries'), 2, 0, 5);
+const retryPasses = clampNumber($nobyda.read('BDTB_RetryPasses'), 1, 0, 3);
+const timeBudgetMs = clampNumber($nobyda.read('BDTB_TimeBudget'), 480, 60, 1800) * 1000;
 const maxPages = clampNumber($nobyda.read('BDTB_MaxPages'), 50, 1, 50);
 const pageSize = 200;
+const passDelayMs = 30000;
+const retryWaitMinMs = 6000;
+const retryWaitMaxMs = 14000;
+const circuitBreakLimit = 6;
 
 const webHeaders = {
   'Content-Type': 'application/x-www-form-urlencoded',
   'Referer': 'https://tieba.baidu.com/index/tbwise/forum',
   'Cookie': cookieVal || '',
   'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 12_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/16A366'
+};
+
+const appHeaders = {
+  'User-Agent': `bdtb for Android ${appVersion}`,
+  'Content-Type': 'application/x-www-form-urlencoded',
+  'Cookie': cookieVal || ''
 };
 
 if ($nobyda.isRequest) {
@@ -41,21 +58,52 @@ async function run() {
   }
 
   try {
-    const index = await request({
-      url: 'https://tieba.baidu.com/mo/q/newmoindex',
-      method: 'GET',
-      headers: webHeaders
-    });
-    const indexBody = parseJson(index.body);
-    if (!(indexBody && indexBody.no === 0 && indexBody.data && indexBody.data.tbs)) {
-      throw new Error((indexBody && indexBody.error) || 'Cookie 可能已失效');
+    let tbs = '';
+    let likeForums = [];
+    try {
+      const index = await request({ url: 'https://tieba.baidu.com/mo/q/newmoindex', method: 'GET', headers: webHeaders });
+      const indexBody = parseJson(index.body);
+      if (indexBody && indexBody.no === 0 && indexBody.data) {
+        tbs = indexBody.data.tbs || '';
+        likeForums = indexBody.data.like_forum || [];
+      }
+    } catch (_) { /* newmoindex 失败时走 dc/common/tbs 兜底 */ }
+
+    if (!tbs) {
+      console.log('newmoindex 未返回 tbs，改用 dc/common/tbs 获取');
+      const tbsResp = await request({ url: 'https://tieba.baidu.com/dc/common/tbs', method: 'GET', headers: webHeaders });
+      const tbsBody = parseJson(tbsResp.body);
+      tbs = tbsBody && tbsBody.tbs;
+      if (!tbs) throw new Error('获取 tbs 失败，Cookie 可能已失效');
     }
 
-    const forums = await getAllForums(indexBody.data.like_forum || []);
+    const bduss = (/(?:^|;\s*)BDUSS=([^;]+)/.exec(cookieVal) || [])[1] || '';
+    if (!bduss) throw new Error('Cookie 中缺少 BDUSS，请重新抓取');
+
+    const forums = await getAllForums(likeForums, bduss);
     if (forums.length === 0) throw new Error('未获取到任何关注贴吧');
 
-    console.log(`关注贴吧总数: ${forums.length}，签到并发: ${concurrency}，请求间隔: ${requestInterval}ms`);
-    const results = await runWithConcurrency(forums, concurrency, requestInterval, forum => signForum(forum, indexBody.data.tbs));
+    console.log(`关注贴吧总数: ${forums.length}，并发: ${concurrency}，间隔: ${requestInterval}ms，重试: ${maxRetries} 次/吧，补签: ${retryPasses} 轮`);
+    const state = { consecutiveRetryable: 0, circuitTripped: false };
+    const deadline = Date.now() + timeBudgetMs;
+    const results = new Array(forums.length);
+    const indices = forums.map((_, i) => i);
+    const firstPass = await runWithConcurrency(indices, concurrency, requestInterval, i => signForum(forums[i], tbs, bduss, state, deadline), deadline);
+    firstPass.forEach((result, i) => { results[i] = result; });
+
+    for (let pass = 1; pass <= retryPasses; pass++) {
+      const failedIndices = results.map((r, i) => (r && r.status === 'failed' ? i : -1)).filter(i => i >= 0);
+      if (failedIndices.length === 0) break;
+      if (Date.now() + passDelayMs > deadline) {
+        console.log('时间预算不足以完成补签轮，跳过');
+        break;
+      }
+      console.log(`第 ${pass}/${retryPasses} 轮补签：${failedIndices.length} 个吧，等待 ${passDelayMs / 1000}s 后开始`);
+      await sleep(passDelayMs);
+      const passResults = await runWithConcurrency(failedIndices, concurrency, requestInterval, i => signForum(forums[i], tbs, bduss, state, deadline), deadline);
+      passResults.forEach((result, j) => { results[failedIndices[j]] = result; });
+    }
+
     summarize(forums.length, results);
   } catch (error) {
     console.log(`贴吧签到异常: ${error.message || error}`);
@@ -64,12 +112,9 @@ async function run() {
   $nobyda.done();
 }
 
-async function getAllForums(initialForums) {
+async function getAllForums(initialForums, bduss) {
   const forumMap = new Map();
   addForums(forumMap, initialForums);
-
-  const bduss = (/(?:^|;\s*)BDUSS=([^;]+)/.exec(cookieVal) || [])[1] || '';
-  if (!bduss) throw new Error('Cookie 中缺少 BDUSS，请重新抓取');
 
   for (let page = 1; page <= maxPages; page++) {
     const response = await fetchForumPage(page, bduss);
@@ -101,18 +146,13 @@ async function fetchForumPage(pageNo, bduss) {
     stTimesNum: 1,
     timestamp: Date.now()
   };
-  params.sign = md5(Object.keys(params).sort().map(key => `${key}=${params[key]}`).join('') + 'tiebaclient!!!');
+  params.sign = clientSign(params);
 
-  const body = Object.keys(params).map(key => `${key}=${encodeURIComponent(params[key])}`).join('&');
   const response = await request({
     url: 'https://c.tieba.baidu.com/c/f/forum/like',
     method: 'POST',
-    headers: {
-      'User-Agent': `bdtb for Android ${appVersion}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Cookie': cookieVal
-    },
-    body
+    headers: appHeaders,
+    body: encodeBody(params)
   });
   const data = parseJson(response.body);
   if (!data || (data.error_code && String(data.error_code) !== '0')) {
@@ -122,19 +162,20 @@ async function fetchForumPage(pageNo, bduss) {
 }
 
 function addForums(map, forums) {
+  if (!Array.isArray(forums)) return;
   for (const forum of forums) {
     const name = String(forum.forum_name || forum.name || '').trim();
     if (!name) continue;
-    const id = forum.forum_id || forum.id;
-    const key = id ? `id:${id}` : `name:${name}`;
-    if (!map.has(key)) map.set(key, { forum_name: name, is_sign: forum.is_sign });
+    const fid = forum.forum_id !== undefined && forum.forum_id !== null && forum.forum_id !== '' ? forum.forum_id : forum.id;
+    const key = fid !== undefined && fid !== null && fid !== '' ? `id:${fid}` : `name:${name}`;
+    if (!map.has(key)) map.set(key, { forum_name: name, fid: fid !== undefined && fid !== null && fid !== '' ? String(fid) : '', is_sign: forum.is_sign });
   }
 }
 
 function extractAppForums(response) {
   if (!response || !response.forum_list) return [];
   if (Array.isArray(response.forum_list)) return response.forum_list;
-  const groups = ['non_gconforum', 'gconforum'];
+  const groups = ['non_gconforum', 'non-gconforum', 'gconforum'];
   return groups.reduce((all, key) => all.concat(Array.isArray(response.forum_list[key]) ? response.forum_list[key] : []), []);
 }
 
@@ -143,49 +184,141 @@ function hasMore(response) {
   return value === 1 || value === '1' || value === true;
 }
 
-async function signForum(forum, tbs) {
+async function signForum(forum, tbs, bduss, state, deadline) {
+  const name = forum.forum_name;
   if (String(forum.is_sign) === '1') {
-    return { name: forum.forum_name, status: 'already', message: '已签到' };
+    return { name, status: 'already', message: '已签到' };
   }
+
+  let last = { name, status: 'failed', retryable: true, message: '未执行' };
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      if (state.circuitTripped || Date.now() > deadline) break;
+      const wait = randInt(retryWaitMinMs, retryWaitMaxMs);
+      console.log(`【${name}】命中临时错误，${(wait / 1000).toFixed(1)}s 后第 ${attempt}/${maxRetries} 次重试`);
+      await sleep(wait);
+      if (Date.now() > deadline) break;
+    }
+
+    const clientResult = await signViaClient(forum, tbs, bduss);
+    if (clientResult.status === 'success' || clientResult.status === 'already') {
+      state.consecutiveRetryable = 0;
+      return { name, ...clientResult };
+    }
+
+    const webResult = await signViaWeb(forum, tbs);
+    if (webResult.status === 'success' || webResult.status === 'already') {
+      state.consecutiveRetryable = 0;
+      return { name, ...webResult };
+    }
+
+    last = {
+      name,
+      status: 'failed',
+      retryable: Boolean(clientResult.retryable || webResult.retryable),
+      message: webResult.message || clientResult.message || '签到失败'
+    };
+    if (!last.retryable) return last;
+
+    state.consecutiveRetryable++;
+    if (!state.circuitTripped && state.consecutiveRetryable >= circuitBreakLimit) {
+      state.circuitTripped = true;
+      console.log('连续多次命中风控/验证码，熔断逐吧重试，仅保留补签轮');
+    }
+  }
+  return last;
+}
+
+async function signViaClient(forum, tbs, bduss) {
+  if (!forum.fid) return { status: 'failed', retryable: true, message: '' };
+  const params = {
+    BDUSS: bduss,
+    _client_type: '2',
+    _client_version: appVersion,
+    _phone_imei: '000000000000000',
+    fid: forum.fid,
+    kw: forum.forum_name,
+    model: 'MI+5',
+    net_type: '1',
+    tbs: tbs,
+    timestamp: Math.floor(Date.now() / 1000)
+  };
+  params.sign = clientSign(params);
+
+  try {
+    const response = await request({
+      url: 'https://c.tieba.baidu.com/c/c/forum/sign',
+      method: 'POST',
+      headers: appHeaders,
+      body: encodeBody(params)
+    });
+    const data = parseJson(response.body);
+    if (!data) return { status: 'failed', retryable: true, message: '' };
+    const code = String(data.error_code === undefined || data.error_code === null ? '' : data.error_code);
+    if (code === '0') {
+      const rank = data.user_info && data.user_info.user_sign_rank;
+      return { status: 'success', message: rank ? `签到成功，今日第 ${rank} 个` : '签到成功' };
+    }
+    if (code === '160002') return { status: 'already', message: '已签到' };
+    const message = `客户端接口: ${data.error_msg || code}`;
+    if (isTransientSignError(code, data.error_msg)) return { status: 'failed', retryable: true, message };
+    return { status: 'failed', retryable: false, message };
+  } catch (_) {
+    return { status: 'failed', retryable: true, message: '' };
+  }
+}
+
+async function signViaWeb(forum, tbs) {
   const body = `tbs=${encodeURIComponent(tbs)}&kw=${encodeURIComponent(forum.forum_name)}&ie=utf-8`;
   try {
     const response = await request({
       url: 'https://tieba.baidu.com/sign/add',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': cookieVal,
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_1_1 like Mac OS X; zh-CN) AppleWebKit/537.51.1 Mobile'
-      },
+      headers: webHeaders,
       body
     });
     const data = parseJson(response.body);
-    if (data && data.no === 0) {
+    if (!data) return { status: 'failed', retryable: true, message: '' };
+    if (Number(data.no) === 0) {
       const uinfo = data.data && data.data.uinfo;
-      return { name: forum.forum_name, status: 'success', message: uinfo ? `连续 ${uinfo.cont_sign_num} 天` : '签到成功' };
+      return { status: 'success', message: uinfo && uinfo.cont_sign_num ? `连续签到 ${uinfo.cont_sign_num} 天` : '签到成功' };
     }
-    if (data && Number(data.no) === 1101) return { name: forum.forum_name, status: 'already', message: '已签到' };
-    return { name: forum.forum_name, status: 'failed', message: (data && (data.error || data.no)) || '响应异常' };
-  } catch (error) {
-    return { name: forum.forum_name, status: 'failed', message: error.message || '网络错误' };
+    if (Number(data.no) === 1101) return { status: 'already', message: '已签到' };
+    return { status: 'failed', retryable: isTransientSignError(data.no, data.error), message: String(data.error || data.no) };
+  } catch (_) {
+    return { status: 'failed', retryable: true, message: '' };
   }
 }
 
-async function runWithConcurrency(items, limit, interval, worker) {
+function isTransientSignError(code, message) {
+  const no = Number(code);
+  return no === 1102 || no === 2150040 || no === 340006 || /vcode|验证码|签得太快/i.test(String(message || ''));
+}
+
+function clientSign(params) {
+  return md5(Object.keys(params).sort().map(key => `${key}=${params[key]}`).join('') + 'tiebaclient!!!').toUpperCase();
+}
+
+function encodeBody(params) {
+  return Object.keys(params).map(key => `${key}=${encodeURIComponent(params[key])}`).join('&');
+}
+
+async function runWithConcurrency(items, limit, interval, worker, deadline) {
   const results = new Array(items.length);
   let next = 0;
   let nextStartAt = 0;
-  async function waitForStartSlot() {
-    const now = Date.now();
-    const wait = Math.max(0, nextStartAt - now);
-    nextStartAt = Math.max(nextStartAt, now) + interval;
-    if (wait) await new Promise(resolve => setTimeout(resolve, wait));
-  }
   async function consume() {
     while (true) {
       const current = next++;
       if (current >= items.length) return;
-      await waitForStartSlot();
+      if (deadline && Date.now() > deadline) {
+        results[current] = { status: 'skipped', message: '时间预算用尽，本轮跳过' };
+        continue;
+      }
+      const now = Date.now();
+      const wait = Math.max(0, nextStartAt - now);
+      nextStartAt = Math.max(nextStartAt, now) + (interval > 0 ? Math.round(interval * (0.7 + Math.random() * 0.6)) : 0);
+      if (wait) await sleep(wait);
       results[current] = await worker(items[current]);
     }
   }
@@ -196,6 +329,7 @@ async function runWithConcurrency(items, limit, interval, worker) {
 function summarize(total, results) {
   const success = results.filter(item => item.status === 'success').length;
   const already = results.filter(item => item.status === 'already').length;
+  const skipped = results.filter(item => item.status === 'skipped').length;
   const failed = results.filter(item => item.status === 'failed');
   const lines = [
     `关注总数：${total}`,
@@ -203,12 +337,13 @@ function summarize(total, results) {
     `已签到：${already}`,
     `失败：${failed.length}`
   ];
+  if (skipped) lines.push(`未处理：${skipped}（时间预算用尽，等待下次运行）`);
   if (failed.length) {
     lines.push('', '失败吧：');
     failed.forEach(item => lines.push(`【${item.name}】${item.message}`));
   }
   console.log(lines.join('\n'));
-  $nobyda.notify('贴吧签到完成', `总计 ${total} 个｜成功 ${success}｜失败 ${failed.length}`, lines.join('\n'));
+  $nobyda.notify('贴吧签到完成', `总计 ${total} 个｜新签 ${success}｜失败 ${failed.length}`, lines.join('\n'));
 }
 
 function request(options) {
@@ -217,6 +352,14 @@ function request(options) {
 
 function parseJson(value) {
   try { return JSON.parse(value); } catch (_) { return null; }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function randInt(min, max) {
+  return Math.floor(min + Math.random() * (max - min + 1));
 }
 
 function clampNumber(value, fallback, min, max) {
@@ -258,7 +401,7 @@ function nobyda() {
   };
 }
 
-/* 纯 JavaScript MD5；用于贴吧移动端关注列表接口的 sign 参数。 */
+/* 纯 JavaScript MD5；用于贴吧移动端接口的 sign 参数。 */
 function md5(input) {
   const bytes = unescape(encodeURIComponent(input));
   const words = [];
