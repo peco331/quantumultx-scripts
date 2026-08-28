@@ -5,15 +5,21 @@
  * - 默认串行签到（并发 1），请求间隔 1200ms 起并叠加随机抖动，降低触发风控的概率
  * - 每个吧先走客户端接口 c/c/forum/sign（带 fid 的 tiebaclient 签名），失败或命中验证码时退回网页接口 sign/add
  * - 命中 need vcode / 签得太快 等临时错误时，随机等待 6–14 秒后自动重试
- * - 整轮结束后对失败的吧再补签一轮；连续多次 vcode 会熔断逐吧重试，避免持续刺激风控
- * - 全程受时间预算约束，超时后跳过剩余贴吧并如实通知（当天的下一次 cron 会继续签）
+ * - 连续多次 vcode 会熔断逐吧重试，避免持续刺激风控
+ *
+ * 结果核验（防止“接口说成功、App 里没签上”）：
+ * - 通知里显示当前账号昵称，便于核对脚本 Cookie 与 App 登录的是否为同一账号
+ * - 签完等待一段时间后重新拉取 newmoindex 的服务器签到状态
+ * - 服务器仍显示未签的吧会自动补签（最多 verifyRounds 轮）
+ * - 最终通知以服务器状态为准：明确列出“服务器显示未签”的吧，而不是只报接口返回
  *
  * 可选持久化配置（$prefs，可用 BoxJS 或其他脚本写入）：
  * - BDTB_Concurrency：同时在途的签到请求数，默认 1，范围 1–10
  * - BDTB_RequestInterval：相邻签到请求的最小启动间隔（毫秒），默认 1200，范围 0–10000
  * - BDTB_MaxRetries：单个吧命中临时错误后的额外重试次数，默认 2，范围 0–5
- * - BDTB_RetryPasses：整轮结束后对失败吧补签的轮数，默认 1，范围 0–3
- * - BDTB_TimeBudget：整次任务的时间预算（秒），默认 480，范围 60–1800
+ * - BDTB_VerifyRounds：签完后按服务器状态补签的轮数，默认 2，范围 0–5
+ * - BDTB_VerifyDelay：每轮核验/补签前的等待毫秒数，默认 20000，范围 0–120000
+ * - BDTB_TimeBudget：整次任务的时间预算（秒），默认 900，范围 300–1800
  * - BDTB_MaxPages：关注列表最多读取的页数，默认 50（每页 200 个）
  */
 
@@ -23,11 +29,11 @@ const appVersion = '9.7.8.0';
 const concurrency = clampNumber($nobyda.read('BDTB_Concurrency'), 1, 1, 10);
 const requestInterval = clampNumber($nobyda.read('BDTB_RequestInterval'), 1200, 0, 10000);
 const maxRetries = clampNumber($nobyda.read('BDTB_MaxRetries'), 2, 0, 5);
-const retryPasses = clampNumber($nobyda.read('BDTB_RetryPasses'), 1, 0, 3);
-const timeBudgetMs = clampNumber($nobyda.read('BDTB_TimeBudget'), 480, 60, 1800) * 1000;
+const verifyRounds = clampNumber($nobyda.read('BDTB_VerifyRounds'), 2, 0, 5);
+const verifyDelayMs = clampNumber($nobyda.read('BDTB_VerifyDelay'), 20000, 0, 120000);
+const timeBudgetMs = clampNumber($nobyda.read('BDTB_TimeBudget'), 900, 300, 1800) * 1000;
 const maxPages = clampNumber($nobyda.read('BDTB_MaxPages'), 50, 1, 50);
 const pageSize = 200;
-const passDelayMs = 30000;
 const retryWaitMinMs = 6000;
 const retryWaitMaxMs = 14000;
 const circuitBreakLimit = 6;
@@ -58,10 +64,13 @@ async function run() {
   }
 
   try {
+    const bduss = (/(?:^|;\s*)BDUSS=([^;]+)/.exec(cookieVal) || [])[1] || '';
+    if (!bduss) throw new Error('Cookie 中缺少 BDUSS，请重新抓取');
+
     let tbs = '';
     let likeForums = [];
     try {
-      const index = await request({ url: 'https://tieba.baidu.com/mo/q/newmoindex', method: 'GET', headers: webHeaders });
+      const index = await request({ url: `https://tieba.baidu.com/mo/q/newmoindex?_=${Date.now()}`, method: 'GET', headers: webHeaders });
       const indexBody = parseJson(index.body);
       if (indexBody && indexBody.no === 0 && indexBody.data) {
         tbs = indexBody.data.tbs || '';
@@ -77,13 +86,13 @@ async function run() {
       if (!tbs) throw new Error('获取 tbs 失败，Cookie 可能已失效');
     }
 
-    const bduss = (/(?:^|;\s*)BDUSS=([^;]+)/.exec(cookieVal) || [])[1] || '';
-    if (!bduss) throw new Error('Cookie 中缺少 BDUSS，请重新抓取');
+    const nickname = await getAccountNickname(bduss);
+    console.log(`当前账号: ${nickname || '未知'}`);
 
     const forums = await getAllForums(likeForums, bduss);
     if (forums.length === 0) throw new Error('未获取到任何关注贴吧');
 
-    console.log(`关注贴吧总数: ${forums.length}，并发: ${concurrency}，间隔: ${requestInterval}ms，重试: ${maxRetries} 次/吧，补签: ${retryPasses} 轮`);
+    console.log(`关注贴吧总数: ${forums.length}，并发: ${concurrency}，间隔: ${requestInterval}ms，重试: ${maxRetries} 次/吧，核验补签: ${verifyRounds} 轮`);
     const state = { consecutiveRetryable: 0, circuitTripped: false };
     const deadline = Date.now() + timeBudgetMs;
     const results = new Array(forums.length);
@@ -91,20 +100,26 @@ async function run() {
     const firstPass = await runWithConcurrency(indices, concurrency, requestInterval, i => signForum(forums[i], tbs, bduss, state, deadline), deadline);
     firstPass.forEach((result, i) => { results[i] = result; });
 
-    for (let pass = 1; pass <= retryPasses; pass++) {
-      const failedIndices = results.map((r, i) => (r && r.status === 'failed' ? i : -1)).filter(i => i >= 0);
-      if (failedIndices.length === 0) break;
-      if (Date.now() + passDelayMs > deadline) {
-        console.log('时间预算不足以完成补签轮，跳过');
+    let statusMap = await fetchSignStatus();
+    for (let round = 1; round <= verifyRounds; round++) {
+      if (!statusMap) {
+        console.log('无法获取服务器签到状态，跳过核验');
         break;
       }
-      console.log(`第 ${pass}/${retryPasses} 轮补签：${failedIndices.length} 个吧，等待 ${passDelayMs / 1000}s 后开始`);
-      await sleep(passDelayMs);
-      const passResults = await runWithConcurrency(failedIndices, concurrency, requestInterval, i => signForum(forums[i], tbs, bduss, state, deadline), deadline);
-      passResults.forEach((result, j) => { results[failedIndices[j]] = result; });
+      const unsignedIndices = forums.map((f, i) => (statusMap.get(statusKey(f)) === false ? i : -1)).filter(i => i >= 0);
+      if (unsignedIndices.length === 0) break;
+      if (Date.now() + verifyDelayMs > deadline) {
+        console.log('时间预算不足以继续核验补签，跳过');
+        break;
+      }
+      console.log(`服务器显示 ${unsignedIndices.length} 个吧仍未签，${verifyDelayMs / 1000}s 后第 ${round}/${verifyRounds} 轮补签`);
+      await sleep(verifyDelayMs);
+      const roundResults = await runWithConcurrency(unsignedIndices, concurrency, requestInterval, i => forceSign(forums[i], tbs, bduss, deadline), deadline);
+      roundResults.forEach((result, j) => { results[unsignedIndices[j]] = result; });
+      statusMap = await fetchSignStatus();
     }
 
-    summarize(forums.length, results);
+    summarize(forums, results, statusMap, nickname);
   } catch (error) {
     console.log(`贴吧签到异常: ${error.message || error}`);
     $nobyda.notify('贴吧签到', '签到失败', String(error.message || error));
@@ -161,6 +176,54 @@ async function fetchForumPage(pageNo, bduss) {
   return data;
 }
 
+async function getAccountNickname(bduss) {
+  try {
+    const params = {
+      BDUSS: bduss,
+      _client_type: '2',
+      _client_version: appVersion,
+      _phone_imei: '000000000000000',
+      model: 'MI+5',
+      net_type: '1',
+      timestamp: Math.floor(Date.now() / 1000)
+    };
+    params.sign = clientSign(params);
+    const response = await request({
+      url: 'https://c.tieba.baidu.com/c/s/sync',
+      method: 'POST',
+      headers: appHeaders,
+      body: encodeBody(params)
+    });
+    const data = parseJson(response.body);
+    const user = data && data.user;
+    return user && (user.name_show || user.name) ? String(user.name_show || user.name) : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+/* 重新拉取“我的贴吧”的服务器签到状态：key 为 fid 或吧名，value 为是否已签。 */
+async function fetchSignStatus() {
+  try {
+    const response = await request({ url: `https://tieba.baidu.com/mo/q/newmoindex?_=${Date.now()}`, method: 'GET', headers: webHeaders });
+    const body = parseJson(response.body);
+    if (!(body && body.no === 0 && body.data && Array.isArray(body.data.like_forum))) return null;
+    const map = new Map();
+    for (const item of body.data.like_forum) {
+      const name = String(item.name || '').trim();
+      if (!name) continue;
+      map.set(String(item.id !== undefined && item.id !== null && item.id !== '' ? item.id : name), String(item.is_sign) === '1');
+    }
+    return map;
+  } catch (_) {
+    return null;
+  }
+}
+
+function statusKey(forum) {
+  return forum.fid || forum.forum_name;
+}
+
 function addForums(map, forums) {
   if (!Array.isArray(forums)) return;
   for (const forum of forums) {
@@ -200,33 +263,57 @@ async function signForum(forum, tbs, bduss, state, deadline) {
       if (Date.now() > deadline) break;
     }
 
-    const clientResult = await signViaClient(forum, tbs, bduss);
-    if (clientResult.status === 'success' || clientResult.status === 'already') {
+    last = await attemptBothChannels(forum, tbs, bduss);
+    if (last.status === 'success' || last.status === 'already') {
       state.consecutiveRetryable = 0;
-      return { name, ...clientResult };
+      return last;
     }
-
-    const webResult = await signViaWeb(forum, tbs);
-    if (webResult.status === 'success' || webResult.status === 'already') {
-      state.consecutiveRetryable = 0;
-      return { name, ...webResult };
-    }
-
-    last = {
-      name,
-      status: 'failed',
-      retryable: Boolean(clientResult.retryable || webResult.retryable),
-      message: webResult.message || clientResult.message || '签到失败'
-    };
-    if (!last.retryable) return last;
 
     state.consecutiveRetryable++;
     if (!state.circuitTripped && state.consecutiveRetryable >= circuitBreakLimit) {
       state.circuitTripped = true;
-      console.log('连续多次命中风控/验证码，熔断逐吧重试，仅保留补签轮');
+      console.log('连续多次命中风控/验证码，熔断逐吧重试，仅保留核验补签');
     }
   }
   return last;
+}
+
+/* 核验轮强制补签：不管列表标记如何，直接再走一遍双通道（服务器显示未签才进到这里）。 */
+async function forceSign(forum, tbs, bduss, deadline) {
+  const name = forum.forum_name;
+  let last = { name, status: 'failed', retryable: true, message: '未执行' };
+  for (let attempt = 0; attempt <= 1; attempt++) {
+    if (attempt > 0) {
+      if (Date.now() > deadline) break;
+      const wait = randInt(retryWaitMinMs, retryWaitMaxMs);
+      console.log(`【${name}】核验补签重试前等待 ${(wait / 1000).toFixed(1)}s`);
+      await sleep(wait);
+      if (Date.now() > deadline) break;
+    }
+    last = await attemptBothChannels(forum, tbs, bduss);
+    if (last.status === 'success' || last.status === 'already') return last;
+  }
+  return last;
+}
+
+async function attemptBothChannels(forum, tbs, bduss) {
+  const name = forum.forum_name;
+  const clientResult = await signViaClient(forum, tbs, bduss);
+  if (clientResult.status === 'success' || clientResult.status === 'already') {
+    return { name, ...clientResult };
+  }
+
+  const webResult = await signViaWeb(forum, tbs);
+  if (webResult.status === 'success' || webResult.status === 'already') {
+    return { name, ...webResult };
+  }
+
+  return {
+    name,
+    status: 'failed',
+    retryable: Boolean(clientResult.retryable || webResult.retryable),
+    message: webResult.message || clientResult.message || '签到失败'
+  };
 }
 
 async function signViaClient(forum, tbs, bduss) {
@@ -326,24 +413,45 @@ async function runWithConcurrency(items, limit, interval, worker, deadline) {
   return results;
 }
 
-function summarize(total, results) {
-  const success = results.filter(item => item.status === 'success').length;
-  const already = results.filter(item => item.status === 'already').length;
-  const skipped = results.filter(item => item.status === 'skipped').length;
-  const failed = results.filter(item => item.status === 'failed');
-  const lines = [
-    `关注总数：${total}`,
-    `新签到：${success}`,
-    `已签到：${already}`,
-    `失败：${failed.length}`
-  ];
-  if (skipped) lines.push(`未处理：${skipped}（时间预算用尽，等待下次运行）`);
-  if (failed.length) {
-    lines.push('', '失败吧：');
-    failed.forEach(item => lines.push(`【${item.name}】${item.message}`));
+function summarize(forums, results, statusMap, nickname) {
+  const lines = [`账号：${nickname || '未知（请核对是否与 App 登录账号一致）'}`, `关注总数：${forums.length}`];
+  let subtitle;
+
+  if (statusMap) {
+    const unsigned = [];
+    let signed = 0;
+    let unknown = 0;
+    forums.forEach((forum, i) => {
+      const value = statusMap.get(statusKey(forum));
+      if (value === true) signed++;
+      else if (value === false) unsigned.push({ name: forum.forum_name, attempt: results[i] });
+      else unknown++;
+    });
+
+    subtitle = `总计 ${forums.length} 个｜已签 ${signed}｜未签 ${unsigned.length}`;
+    lines.push(`服务器确认已签：${signed}`, `服务器显示未签：${unsigned.length}`);
+    if (unknown) lines.push(`未能核验（不在服务器列表中）：${unknown}`);
+    if (unsigned.length) {
+      lines.push('', '以下吧服务器显示未签（脚本已多轮尝试，建议手动签）：');
+      unsigned.forEach(item => lines.push(`【${item.name}】${item.attempt && item.attempt.message ? item.attempt.message : '尝试结果未知'}`));
+    }
+  } else {
+    const success = results.filter(item => item.status === 'success').length;
+    const already = results.filter(item => item.status === 'already').length;
+    const failed = results.filter(item => item.status === 'failed');
+    const skipped = results.filter(item => item.status === 'skipped').length;
+    subtitle = `总计 ${forums.length} 个｜新签 ${success}｜失败 ${failed.length}`;
+    lines.push(`新签到：${success}`, `已签到：${already}`, `失败：${failed.length}`);
+    if (skipped) lines.push(`未处理：${skipped}（时间预算用尽）`);
+    if (failed.length) {
+      lines.push('', '失败吧：');
+      failed.forEach(item => lines.push(`【${item.name}】${item.message}`));
+    }
+    lines.push('', '（未能获取服务器签到状态，以上为签到接口返回结果）');
   }
+
   console.log(lines.join('\n'));
-  $nobyda.notify('贴吧签到完成', `总计 ${total} 个｜新签 ${success}｜失败 ${failed.length}`, lines.join('\n'));
+  $nobyda.notify('贴吧签到完成', subtitle, lines.join('\n'));
 }
 
 function request(options) {
