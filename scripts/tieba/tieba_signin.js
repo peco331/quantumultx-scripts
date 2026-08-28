@@ -9,17 +9,18 @@
  *
  * 结果核验（防止“接口说成功、App 里没签上”）：
  * - 通知里显示当前账号昵称，便于核对脚本 Cookie 与 App 登录的是否为同一账号
- * - 签完等待一段时间后重新拉取 newmoindex 的服务器签到状态
- * - 服务器仍显示未签的吧会自动补签（最多 verifyRounds 轮）
- * - 最终通知以服务器状态为准：明确列出“服务器显示未签”的吧，而不是只报接口返回
+ * - 签完后从 newmoindex + c/f/forum/like 两个来源重新拉取服务器签到状态
+ * - 对“服务器显示未签”或“接口自称成功但服务器无记录”的吧强制再签一遍复核
+ *   （复核返回“已签过/成功”才算确认；不依赖任何列表字段，接口说已签也算服务器结论）
+ * - 最终通知只报“已签/未确认”两种状态，未确认的逐个列出
  *
  * 可选持久化配置（$prefs，可用 BoxJS 或其他脚本写入）：
  * - BDTB_Concurrency：同时在途的签到请求数，默认 1，范围 1–10
  * - BDTB_RequestInterval：相邻签到请求的最小启动间隔（毫秒），默认 1200，范围 0–10000
  * - BDTB_MaxRetries：单个吧命中临时错误后的额外重试次数，默认 2，范围 0–5
- * - BDTB_VerifyRounds：签完后按服务器状态补签的轮数，默认 2，范围 0–5
+ * - BDTB_VerifyRounds：签完后核验补签的轮数，默认 2，范围 0–5
  * - BDTB_VerifyDelay：每轮核验/补签前的等待毫秒数，默认 20000，范围 0–120000
- * - BDTB_TimeBudget：整次任务的时间预算（秒），默认 900，范围 300–1800
+ * - BDTB_TimeBudget：整次任务的时间预算（秒），默认 1200，范围 300–2400
  * - BDTB_MaxPages：关注列表最多读取的页数，默认 50（每页 200 个）
  */
 
@@ -31,7 +32,7 @@ const requestInterval = clampNumber($nobyda.read('BDTB_RequestInterval'), 1200, 
 const maxRetries = clampNumber($nobyda.read('BDTB_MaxRetries'), 2, 0, 5);
 const verifyRounds = clampNumber($nobyda.read('BDTB_VerifyRounds'), 2, 0, 5);
 const verifyDelayMs = clampNumber($nobyda.read('BDTB_VerifyDelay'), 20000, 0, 120000);
-const timeBudgetMs = clampNumber($nobyda.read('BDTB_TimeBudget'), 900, 300, 1800) * 1000;
+const timeBudgetMs = clampNumber($nobyda.read('BDTB_TimeBudget'), 1200, 300, 2400) * 1000;
 const maxPages = clampNumber($nobyda.read('BDTB_MaxPages'), 50, 1, 50);
 const pageSize = 200;
 const retryWaitMinMs = 6000;
@@ -68,14 +69,10 @@ async function run() {
     if (!bduss) throw new Error('Cookie 中缺少 BDUSS，请重新抓取');
 
     let tbs = '';
-    let likeForums = [];
     try {
       const index = await request({ url: `https://tieba.baidu.com/mo/q/newmoindex?_=${Date.now()}`, method: 'GET', headers: webHeaders });
       const indexBody = parseJson(index.body);
-      if (indexBody && indexBody.no === 0 && indexBody.data) {
-        tbs = indexBody.data.tbs || '';
-        likeForums = indexBody.data.like_forum || [];
-      }
+      if (indexBody && indexBody.no === 0 && indexBody.data) tbs = indexBody.data.tbs || '';
     } catch (_) { /* newmoindex 失败时走 dc/common/tbs 兜底 */ }
 
     if (!tbs) {
@@ -89,7 +86,7 @@ async function run() {
     const nickname = await getAccountNickname(bduss);
     console.log(`当前账号: ${nickname || '未知'}`);
 
-    const forums = await getAllForums(likeForums, bduss);
+    const forums = await getAllForums(bduss);
     if (forums.length === 0) throw new Error('未获取到任何关注贴吧');
 
     console.log(`关注贴吧总数: ${forums.length}，并发: ${concurrency}，间隔: ${requestInterval}ms，重试: ${maxRetries} 次/吧，核验补签: ${verifyRounds} 轮`);
@@ -100,23 +97,38 @@ async function run() {
     const firstPass = await runWithConcurrency(indices, concurrency, requestInterval, i => signForum(forums[i], tbs, bduss, state, deadline), deadline);
     firstPass.forEach((result, i) => { results[i] = result; });
 
-    let statusMap = await fetchSignStatus();
+    const reverified = new Set();
+    let statusMap = await fetchSignStatus(bduss);
+    if (statusMap && statusMap.size === 0) {
+      console.log('两个来源都没有返回签到状态，改用签到接口二次确认');
+      statusMap = null;
+    }
+
     for (let round = 1; round <= verifyRounds; round++) {
-      if (!statusMap) {
-        console.log('无法获取服务器签到状态，跳过核验');
-        break;
-      }
-      const unsignedIndices = forums.map((f, i) => (statusMap.get(statusKey(f)) === false ? i : -1)).filter(i => i >= 0);
-      if (unsignedIndices.length === 0) break;
       if (Date.now() + verifyDelayMs > deadline) {
         console.log('时间预算不足以继续核验补签，跳过');
         break;
       }
-      console.log(`服务器显示 ${unsignedIndices.length} 个吧仍未签，${verifyDelayMs / 1000}s 后第 ${round}/${verifyRounds} 轮补签`);
+      const targets = [];
+      forums.forEach((forum, i) => {
+        const flag = statusMap ? statusMap.get(forum.forum_name) : undefined;
+        const status = results[i] && results[i].status;
+        const doubtful = statusMap
+          ? flag === false || (flag === undefined && (status === 'success' || status === 'failed') && !reverified.has(i))
+          : (status === 'success' || status === 'failed') && !reverified.has(i);
+        if (doubtful) targets.push(i);
+      });
+      if (targets.length === 0) break;
+      console.log(`核验第 ${round}/${verifyRounds} 轮：${targets.length} 个吧需要复核/补签，${verifyDelayMs / 1000}s 后开始`);
       await sleep(verifyDelayMs);
-      const roundResults = await runWithConcurrency(unsignedIndices, concurrency, requestInterval, i => forceSign(forums[i], tbs, bduss, deadline), deadline);
-      roundResults.forEach((result, j) => { results[unsignedIndices[j]] = result; });
-      statusMap = await fetchSignStatus();
+      const roundResults = await runWithConcurrency(targets, concurrency, requestInterval, i => forceSign(forums[i], tbs, bduss, deadline), deadline);
+      roundResults.forEach((result, j) => {
+        const i = targets[j];
+        results[i] = result;
+        if (result.status === 'success' || result.status === 'already') reverified.add(i);
+      });
+      statusMap = await fetchSignStatus(bduss);
+      if (statusMap && statusMap.size === 0) statusMap = null;
     }
 
     summarize(forums, results, statusMap, nickname);
@@ -127,10 +139,8 @@ async function run() {
   $nobyda.done();
 }
 
-async function getAllForums(initialForums, bduss) {
+async function getAllForums(bduss) {
   const forumMap = new Map();
-  addForums(forumMap, initialForums);
-
   for (let page = 1; page <= maxPages; page++) {
     const response = await fetchForumPage(page, bduss);
     const pageForums = extractAppForums(response);
@@ -139,7 +149,6 @@ async function getAllForums(initialForums, bduss) {
 
     if (!hasMore(response)) break;
   }
-
   return Array.from(forumMap.values());
 }
 
@@ -195,43 +204,98 @@ async function getAccountNickname(bduss) {
       body: encodeBody(params)
     });
     const data = parseJson(response.body);
-    const user = data && data.user;
-    return user && (user.name_show || user.name) ? String(user.name_show || user.name) : '';
-  } catch (_) {
+    const user = data && (data.user || (data.data && data.data.user));
+    if (user && (user.name_show || user.nickname || user.name)) {
+      return String(user.name_show || user.nickname || user.name);
+    }
+    console.log(`账号信息响应（未解析到昵称）: ${String(response.body).slice(0, 200)}`);
+    return '';
+  } catch (error) {
+    console.log(`获取账号信息失败: ${error.message || error}`);
     return '';
   }
 }
 
-/* 重新拉取“我的贴吧”的服务器签到状态：key 为 fid 或吧名，value 为是否已签。 */
-async function fetchSignStatus() {
+/* 从 newmoindex + c/f/forum/like 两个来源收集服务器签到状态，key 为吧名。
+   只有字段明确为 1/0 才计入；两个来源都拿不到的字段不计入（unknown）。 */
+async function fetchSignStatus(bduss) {
+  const map = new Map();
+  let newIndexCount = 0;
+  let likeCount = 0;
+  let newIndexSample = null;
+  let likeSample = null;
+
   try {
     const response = await request({ url: `https://tieba.baidu.com/mo/q/newmoindex?_=${Date.now()}`, method: 'GET', headers: webHeaders });
     const body = parseJson(response.body);
-    if (!(body && body.no === 0 && body.data && Array.isArray(body.data.like_forum))) return null;
-    const map = new Map();
-    for (const item of body.data.like_forum) {
-      const name = String(item.name || '').trim();
-      if (!name) continue;
-      map.set(String(item.id !== undefined && item.id !== null && item.id !== '' ? item.id : name), String(item.is_sign) === '1');
+    const list = body && body.no === 0 && body.data && body.data.like_forum;
+    if (Array.isArray(list)) {
+      for (const item of list) {
+        if (!newIndexSample) newIndexSample = item;
+        newIndexCount++;
+        mergeFlag(map, nameOf(item), readSignFlag(item));
+      }
     }
-    return map;
-  } catch (_) {
-    return null;
+  } catch (_) { /* 忽略，靠关注接口兜底 */ }
+
+  try {
+    for (let page = 1; page <= maxPages; page++) {
+      const data = await fetchForumPage(page, bduss);
+      const list = extractAppForums(data);
+      for (const item of list) {
+        if (!likeSample) likeSample = item;
+        likeCount++;
+        mergeFlag(map, nameOf(item), readSignFlag(item));
+      }
+      if (!hasMore(data)) break;
+    }
+  } catch (error) {
+    console.log(`核验拉取关注列表中断: ${error.message || error}`);
   }
+
+  console.log(`核验数据：newmoindex ${newIndexCount} 条，关注接口 ${likeCount} 条，合并 ${map.size} 条`);
+  if (newIndexCount && !likeCount) console.log(`newmoindex 示例: ${JSON.stringify(newIndexSample).slice(0, 300)}`);
+  if (likeCount) console.log(`关注接口示例: ${JSON.stringify(likeSample).slice(0, 300)}`);
+  return map;
 }
 
-function statusKey(forum) {
-  return forum.fid || forum.forum_name;
+function nameOf(item) {
+  return String((item && (item.forum_name || item.name)) || '').trim();
+}
+
+function readSignFlag(item) {
+  if (!item) return undefined;
+  const candidates = [
+    item.is_sign, item.isSign, item.is_signed,
+    item.user_info && item.user_info.is_sign,
+    item.user_info && item.user_info.isSign
+  ];
+  for (const value of candidates) {
+    if (value !== undefined && value !== null && value !== '') return String(value) === '1';
+  }
+  return undefined;
+}
+
+function mergeFlag(map, name, flag) {
+  if (!name || flag === undefined) return;
+  if (flag === false) map.set(name, false);
+  else if (!map.has(name)) map.set(name, true);
 }
 
 function addForums(map, forums) {
   if (!Array.isArray(forums)) return;
   for (const forum of forums) {
-    const name = String(forum.forum_name || forum.name || '').trim();
+    const name = nameOf(forum);
     if (!name) continue;
     const fid = forum.forum_id !== undefined && forum.forum_id !== null && forum.forum_id !== '' ? forum.forum_id : forum.id;
     const key = fid !== undefined && fid !== null && fid !== '' ? `id:${fid}` : `name:${name}`;
-    if (!map.has(key)) map.set(key, { forum_name: name, fid: fid !== undefined && fid !== null && fid !== '' ? String(fid) : '', is_sign: forum.is_sign });
+    if (!map.has(key)) {
+      map.set(key, {
+        forum_name: name,
+        fid: fid !== undefined && fid !== null && fid !== '' ? String(fid) : '',
+        is_sign: readSignFlag(forum)
+      });
+    }
   }
 }
 
@@ -249,7 +313,7 @@ function hasMore(response) {
 
 async function signForum(forum, tbs, bduss, state, deadline) {
   const name = forum.forum_name;
-  if (String(forum.is_sign) === '1') {
+  if (forum.is_sign === true) {
     return { name, status: 'already', message: '已签到' };
   }
 
@@ -278,7 +342,8 @@ async function signForum(forum, tbs, bduss, state, deadline) {
   return last;
 }
 
-/* 核验轮强制补签：不管列表标记如何，直接再走一遍双通道（服务器显示未签才进到这里）。 */
+/* 核验轮强制复核：不管之前的结论如何，重新走一遍双通道。
+   返回“成功/已签过”即为服务器确认；其他结果按失败处理。 */
 async function forceSign(forum, tbs, bduss, deadline) {
   const name = forum.forum_name;
   let last = { name, status: 'failed', retryable: true, message: '未执行' };
@@ -286,7 +351,7 @@ async function forceSign(forum, tbs, bduss, deadline) {
     if (attempt > 0) {
       if (Date.now() > deadline) break;
       const wait = randInt(retryWaitMinMs, retryWaitMaxMs);
-      console.log(`【${name}】核验补签重试前等待 ${(wait / 1000).toFixed(1)}s`);
+      console.log(`【${name}】核验复核重试前等待 ${(wait / 1000).toFixed(1)}s`);
       await sleep(wait);
       if (Date.now() > deadline) break;
     }
@@ -415,41 +480,33 @@ async function runWithConcurrency(items, limit, interval, worker, deadline) {
 
 function summarize(forums, results, statusMap, nickname) {
   const lines = [`账号：${nickname || '未知（请核对是否与 App 登录账号一致）'}`, `关注总数：${forums.length}`];
-  let subtitle;
+  const problems = [];
+  let signed = 0;
 
-  if (statusMap) {
-    const unsigned = [];
-    let signed = 0;
-    let unknown = 0;
-    forums.forEach((forum, i) => {
-      const value = statusMap.get(statusKey(forum));
-      if (value === true) signed++;
-      else if (value === false) unsigned.push({ name: forum.forum_name, attempt: results[i] });
-      else unknown++;
-    });
+  forums.forEach((forum, i) => {
+    const serverFlag = statusMap ? statusMap.get(forum.forum_name) : undefined;
+    const attempt = results[i];
+    const attemptOk = attempt && (attempt.status === 'success' || attempt.status === 'already');
+    if (serverFlag === true || attemptOk) {
+      signed++;
+    } else {
+      const reason = attempt && attempt.message ? attempt.message
+        : serverFlag === false ? '服务器显示未签'
+        : '未确认';
+      problems.push({ name: forum.forum_name, message: reason });
+    }
+  });
 
-    subtitle = `总计 ${forums.length} 个｜已签 ${signed}｜未签 ${unsigned.length}`;
-    lines.push(`服务器确认已签：${signed}`, `服务器显示未签：${unsigned.length}`);
-    if (unknown) lines.push(`未能核验（不在服务器列表中）：${unknown}`);
-    if (unsigned.length) {
-      lines.push('', '以下吧服务器显示未签（脚本已多轮尝试，建议手动签）：');
-      unsigned.forEach(item => lines.push(`【${item.name}】${item.attempt && item.attempt.message ? item.attempt.message : '尝试结果未知'}`));
-    }
-  } else {
-    const success = results.filter(item => item.status === 'success').length;
-    const already = results.filter(item => item.status === 'already').length;
-    const failed = results.filter(item => item.status === 'failed');
-    const skipped = results.filter(item => item.status === 'skipped').length;
-    subtitle = `总计 ${forums.length} 个｜新签 ${success}｜失败 ${failed.length}`;
-    lines.push(`新签到：${success}`, `已签到：${already}`, `失败：${failed.length}`);
-    if (skipped) lines.push(`未处理：${skipped}（时间预算用尽）`);
-    if (failed.length) {
-      lines.push('', '失败吧：');
-      failed.forEach(item => lines.push(`【${item.name}】${item.message}`));
-    }
-    lines.push('', '（未能获取服务器签到状态，以上为签到接口返回结果）');
+  const source = statusMap
+    ? `（核验数据 ${statusMap.size} 条）`
+    : '（服务器状态列表不可用，已签结果来自签到接口复核）';
+  lines.push(`已签：${signed}`, `未确认：${problems.length}`, source);
+  if (problems.length) {
+    lines.push('', '以下吧未确认签到成功：');
+    problems.forEach(item => lines.push(`【${item.name}】${item.message}`));
   }
 
+  const subtitle = `总计 ${forums.length}｜已签 ${signed}｜未确认 ${problems.length}`;
   console.log(lines.join('\n'));
   $nobyda.notify('贴吧签到完成', subtitle, lines.join('\n'));
 }
