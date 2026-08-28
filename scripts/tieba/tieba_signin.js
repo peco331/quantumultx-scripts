@@ -4,18 +4,20 @@
  * 改动：
  * - 使用 c.tieba.baidu.com/c/f/forum/like 分页获取关注列表（每页 200 条）
  * - 合并 newmoindex 的结果并按 forum_id / 名称去重
- * - 不再限制 100 个，也没有批次之间的 setTimeout 等待
- * - 使用有限并发直接提交全部签到请求，避免并发时复用 POST body 的竞态
+ * - 不再限制 100 个，也没有分批停顿；所有关注贴吧在同一次任务内处理
+ * - 使用低并发和连续请求节流，减少“need vcode”概率，避免并发时复用 POST body 的竞态
  *
  * 可选持久化配置：
- * - BDTB_Concurrency：同时发起的签到请求数，默认 8，范围 1–20
+ * - BDTB_Concurrency：同时在途的签到请求数，默认 2，范围 1–20
+ * - BDTB_RequestInterval：相邻签到请求的最小启动间隔（毫秒），默认 300，范围 0–3000
  * - BDTB_MaxPages：关注列表最多读取的页数，默认 50（每页 200 个）
  */
 
 const $nobyda = nobyda();
 const cookieVal = $nobyda.read('CookieTB');
 const appVersion = '9.7.8.0';
-const concurrency = clampNumber($nobyda.read('BDTB_Concurrency'), 8, 1, 20);
+const concurrency = clampNumber($nobyda.read('BDTB_Concurrency'), 2, 1, 20);
+const requestInterval = clampNumber($nobyda.read('BDTB_RequestInterval'), 300, 0, 3000);
 const maxPages = clampNumber($nobyda.read('BDTB_MaxPages'), 50, 1, 50);
 const pageSize = 200;
 
@@ -52,8 +54,8 @@ async function run() {
     const forums = await getAllForums(indexBody.data.like_forum || []);
     if (forums.length === 0) throw new Error('未获取到任何关注贴吧');
 
-    console.log(`关注贴吧总数: ${forums.length}，签到并发: ${concurrency}`);
-    const results = await runWithConcurrency(forums, concurrency, forum => signForum(forum, indexBody.data.tbs));
+    console.log(`关注贴吧总数: ${forums.length}，签到并发: ${concurrency}，请求间隔: ${requestInterval}ms`);
+    const results = await runWithConcurrency(forums, concurrency, requestInterval, forum => signForum(forum, indexBody.data.tbs));
     summarize(forums.length, results);
   } catch (error) {
     console.log(`贴吧签到异常: ${error.message || error}`);
@@ -169,13 +171,21 @@ async function signForum(forum, tbs) {
   }
 }
 
-async function runWithConcurrency(items, limit, worker) {
+async function runWithConcurrency(items, limit, interval, worker) {
   const results = new Array(items.length);
   let next = 0;
+  let nextStartAt = 0;
+  async function waitForStartSlot() {
+    const now = Date.now();
+    const wait = Math.max(0, nextStartAt - now);
+    nextStartAt = Math.max(nextStartAt, now) + interval;
+    if (wait) await new Promise(resolve => setTimeout(resolve, wait));
+  }
   async function consume() {
     while (true) {
       const current = next++;
       if (current >= items.length) return;
+      await waitForStartSlot();
       results[current] = await worker(items[current]);
     }
   }
@@ -194,8 +204,8 @@ function summarize(total, results) {
     `失败：${failed.length}`
   ];
   if (failed.length) {
-    lines.push('', '失败吧（最多列出 20 个）：');
-    failed.slice(0, 20).forEach(item => lines.push(`【${item.name}】${item.message}`));
+    lines.push('', '失败吧：');
+    failed.forEach(item => lines.push(`【${item.name}】${item.message}`));
   }
   console.log(lines.join('\n'));
   $nobyda.notify('贴吧签到完成', `总计 ${total} 个｜成功 ${success}｜失败 ${failed.length}`, lines.join('\n'));
