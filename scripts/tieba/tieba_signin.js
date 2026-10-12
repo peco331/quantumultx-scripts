@@ -25,7 +25,7 @@
  */
 
 const $nobyda = nobyda();
-const cookieVal = $nobyda.read('CookieTB');
+const cookieVal = minimalTiebaCookie($nobyda.read('CookieTB'));
 const appVersion = '9.7.8.0';
 const concurrency = clampNumber($nobyda.read('BDTB_Concurrency'), 1, 1, 10);
 const requestInterval = clampNumber($nobyda.read('BDTB_RequestInterval'), 1200, 0, 10000);
@@ -60,7 +60,7 @@ if ($nobyda.isRequest) {
 
 async function run() {
   if (!cookieVal) {
-    $nobyda.notify('贴吧签到', '签到失败', '未获取到 Cookie，请先在贴吧 App 的“我的”页面抓取 Cookie');
+    $nobyda.notify('贴吧签到', '签到失败', '未获取到 Cookie，请先抓取 README 中指定的 HTTPS 请求');
     return $nobyda.done();
   }
 
@@ -543,18 +543,24 @@ function clampNumber(value, fallback, min, max) {
   return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.floor(number))) : fallback;
 }
 
+function minimalTiebaCookie(value) {
+  const match = /(?:^|;\s*)BDUSS=([^;\s]+)/.exec(String(value || ''));
+  return match ? `BDUSS=${match[1]}` : '';
+}
+
 function getCookie() {
   // Reject lookalike hosts, plaintext traffic and unrelated requests.
   if (!/^https:\/\/tieba\.baidu\.com(?::443)?\/mo\/q\/newmoindex(?:\?[^#]*)?$/.test($request.url || '')) {
     $nobyda.done();
     return;
   }
-  const headerCookie = $request.headers.Cookie || $request.headers.cookie;
+  const headers = $request.headers || {};
+  const headerCookie = minimalTiebaCookie(headers.Cookie || headers.cookie);
   if (headerCookie && headerCookie.includes('BDUSS=')) {
     $nobyda.write(headerCookie, 'CookieTB');
     $nobyda.notify('百度贴吧', 'Cookie 获取成功', '可以使用全量签到功能');
   } else {
-    $nobyda.notify('百度贴吧', 'Cookie 获取失败', '请确保抓取的是贴吧 App 请求且包含 BDUSS');
+    $nobyda.notify('百度贴吧', 'Cookie 获取失败', '请确认指定 HTTPS 请求包含 BDUSS');
   }
   $nobyda.done();
 }
