@@ -4,7 +4,7 @@
   "task": [
     {
       "config": "0 9 * * * https://raw.githubusercontent.com/peco331/quantumultx-scripts/6a4393d838a532afff714847c03fb9a42a908dce/scripts/tieba/tieba_signin.js, tag=百度贴吧签到, img-url=https://raw.githubusercontent.com/Orz-3/mini/master/Color/tieba.png, enabled=false",
-      "addons": "https://raw.githubusercontent.com/peco331/quantumultx-scripts/main/rewrite/tieba.conf, tag=百度贴吧Cookie, update-interval=86400, opt-parser=false, enabled=false"
+      "addons": "https://raw.githubusercontent.com/peco331/quantumultx-scripts/de65152482f1cba368e8f212b6dc6241fcb8d632/rewrite/tieba.conf, tag=百度贴吧Cookie, update-interval=86400, opt-parser=false, enabled=false"
     }
   ]
 }
