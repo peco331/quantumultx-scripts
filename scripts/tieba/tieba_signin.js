@@ -84,7 +84,6 @@ async function run() {
     }
 
     const nickname = await getAccountNickname(bduss);
-    console.log(`当前账号: ${nickname || '未知'}`);
 
     const forums = await getAllForums(bduss);
     if (forums.length === 0) throw new Error('未获取到任何关注贴吧');
@@ -133,7 +132,7 @@ async function run() {
 
     summarize(forums, results, statusMap, nickname);
   } catch (error) {
-    console.log(`贴吧签到异常: ${error.message || error}`);
+    console.log(`贴吧签到异常: 请求失败`);
     $nobyda.notify('贴吧签到', '签到失败', String(error.message || error));
   }
   $nobyda.done();
@@ -217,10 +216,9 @@ async function getAccountNickname(bduss) {
       }
     }
     if (nickname) return nickname;
-    console.log(`账号信息响应（未解析到昵称）: ${String(response.body || '').slice(0, 300)}`);
     return '';
   } catch (error) {
-    console.log(`获取账号信息失败: ${error.message || error}`);
+    console.log(`获取账号信息失败: 请求失败`);
     return '';
   }
 }
@@ -259,12 +257,10 @@ async function fetchSignStatus(bduss) {
       if (!hasMore(data)) break;
     }
   } catch (error) {
-    console.log(`核验拉取关注列表中断: ${error.message || error}`);
+    console.log(`核验拉取关注列表中断: 请求失败`);
   }
 
   console.log(`核验数据：newmoindex ${newIndexCount} 条，关注接口 ${likeCount} 条，合并 ${map.size} 条`);
-  if (newIndexCount && !likeCount) console.log(`newmoindex 示例: ${JSON.stringify(newIndexSample).slice(0, 300)}`);
-  if (likeCount) console.log(`关注接口示例: ${JSON.stringify(likeSample).slice(0, 300)}`);
   return map;
 }
 
@@ -521,7 +517,7 @@ function summarize(forums, results, statusMap, nickname) {
   }
 
   const subtitle = `总计 ${forums.length}｜已签 ${signed}｜状态未更新 ${conflicts.length}｜未确认 ${problems.length}`;
-  console.log(lines.join('\n'));
+  console.log('贴吧签到已完成；详情仅在本机通知中显示');
   $nobyda.notify('贴吧签到完成', subtitle, lines.join('\n'));
 }
 
@@ -548,6 +544,11 @@ function clampNumber(value, fallback, min, max) {
 }
 
 function getCookie() {
+  // Reject lookalike hosts, plaintext traffic and unrelated requests.
+  if (!/^https:\/\/tieba\.baidu\.com(?::443)?\/mo\/q\/newmoindex(?:\?[^#]*)?$/.test($request.url || '')) {
+    $nobyda.done();
+    return;
+  }
   const headerCookie = $request.headers.Cookie || $request.headers.cookie;
   if (headerCookie && headerCookie.includes('BDUSS=')) {
     $nobyda.write(headerCookie, 'CookieTB');

@@ -45,3 +45,12 @@ personal/
 test/
 *.bak
 *.tmp
+
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+gitleaks-report*.json
+__pycache__/
